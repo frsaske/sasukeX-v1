@@ -1,4 +1,4 @@
- require('dotenv').config();
+require('dotenv').config();
 const path = require('path');
 const pino = require('pino');
 const TelegramBot = require('node-telegram-bot-api');
