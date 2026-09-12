@@ -1,1 +1,17 @@
- 
+{
+  "name": "wa-tg-bot",
+  "version": "1.0.0",
+  "description": "WhatsApp bot (Baileys) controlled via Telegram",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "@hapi/boom": "^10.0.1",
+    "pino": "^9.4.0",
+    "node-telegram-bot-api": "^0.66.0",
+    "dotenv": "^16.4.5"
+  }
+}
