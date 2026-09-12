@@ -1,6 +1,6 @@
 /**
- * Muaz Plus - personal WhatsApp automation bot
- * Private use only. Direct Baileys WebSocket — no browser automation/server.
+ * ꜱᴀꜱᴜᴋᴇX - private WhatsApp automation bot
+ * Direct Baileys WebSocket + Telegram bridge control.
  */
 
 const fs = require('fs');
@@ -17,22 +17,16 @@ const {
   delay
 } = require('@whiskeysockets/baileys');
 const settings = require('./settings');
+const tg = require('./telegram');
 const { handleIncoming, handleStatusEvent, cacheContactNames } = require('./handlers');
 
 const SESSION_DIR = path.join(process.cwd(), 'session');
 let reconnectTimer = null;
 let startInProgress = false;
 let stopping = false;
-// WhatsApp/Baileys drops and silently re-establishes the socket periodically
-// (commonly every ~1 hour) even while the session stays authenticated. Each
-// re-establishment fires a fresh 'open' connection event. This flag ensures
-// the "connected" notice is sent only once per process run, not on every
-// automatic reconnect.
 let ownerNotifiedThisRun = false;
 
-// Cache recently sent message payloads so Baileys can answer WhatsApp retry
-// requests with the original message instead of leaving the recipient on the
-// "Waiting for this message..." placeholder.
+// ─── Message cache (retry receipts) ─────────────
 const sentMessageCache = new Map();
 const SENT_CACHE_TTL = 10 * 60 * 1000;
 const SENT_CACHE_MAX = 1000;
@@ -65,11 +59,14 @@ const rl = process.stdin.isTTY
   ? readline.createInterface({ input: process.stdin, output: process.stdout })
   : null;
 
-function log(message) { console.log(`[MUAZ] ${message}`); }
-function warn(message) { console.warn(`[MUAZ] ⚠️ ${message}`); }
+// ─── Logging (Telegram + console) ───────────────
+function log(message) { console.log(`[SASUKEX] ${message}`); }
+function warn(message) { console.warn(`[SASUKEX] ⚠️ ${message}`); }
 function fail(message, error) {
-  console.error(`[MUAZ] ❌ ${message}`, error ? `\n   ${error?.stack || error?.message || error}` : '');
+  console.error(`[SASUKEX] ❌ ${message}`, error ? `\n   ${error?.stack || error?.message || error}` : '');
+  tg.send(`❌ *Error:* ${message}`);
 }
+
 function question(text) {
   if (rl) return new Promise(resolve => rl.question(text, resolve));
   return Promise.resolve(settings.ownerNumber || '');
@@ -90,7 +87,7 @@ function statusCodeOf(error) {
 function ensureSessionFolder() {
   if (!fs.existsSync(SESSION_DIR)) {
     fs.mkdirSync(SESSION_DIR, { recursive: true });
-    log('☕ Grab a coffee — session folder has been created.');
+    log('☕ Session folder created.');
     log(`📁 Session path: ${SESSION_DIR}`);
   } else {
     log(`📁 Session folder found: ${SESSION_DIR}`);
@@ -100,30 +97,33 @@ function showSessionFiles() {
   try {
     const files = fs.readdirSync(SESSION_DIR);
     if (files.includes('creds.json')) {
-      log('🔐 creds.json found — existing WhatsApp credentials will be reused.');
+      log('🔐 creds.json found — reusing existing credentials.');
     } else {
-      log('🔐 creds.json not found — fresh WhatsApp login detected.');
-      log('📝 Baileys will create creds.json automatically during authentication.');
+      log('🔐 creds.json not found — fresh WhatsApp login.');
     }
   } catch (e) { warn(`Could not inspect session folder: ${e.message}`); }
 }
 async function getCurrentWaVersion() {
-  log('🌐 Looking for the current WhatsApp Web API version...');
+  log('🌐 Fetching current WhatsApp Web version...');
   const result = await fetchLatestWaWebVersion({});
-  if (!result?.version?.length) throw new Error('Could not obtain current WhatsApp Web version');
+  if (!result?.version?.length) throw new Error('Could not obtain WhatsApp Web version');
   log(`🌐 WhatsApp Web version: ${result.version.join('.')} ${result.isLatest ? '(latest)' : '(server suggested)'}`);
   return result.version;
 }
 
-async function start() {
+// ═══════════════════════════════════════════════
+// START — WhatsApp connection
+// ═══════════════════════════════════════════════
+async function start(phoneOverride = null) {
   if (startInProgress || stopping) return;
   startInProgress = true;
   try {
     log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     log(`🚀 Starting ${settings.botName}...`);
-    log('🔌 Direct WhatsApp WebSocket connection — no Selenium/Chrome/server.');
+    log('🔌 Direct WhatsApp WebSocket connection.');
     log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
+    global.__waStatus = 'starting';
     ensureSessionFolder();
     showSessionFiles();
     const version = await getCurrentWaVersion();
@@ -133,16 +133,17 @@ async function start() {
     const registeredAtStartup = !!state.creds.registered;
 
     if (registeredAtStartup) {
-      log('♻️ Existing authenticated session detected. Restoring session...');
+      log('♻️ Existing session detected. Restoring...');
+      tg.send('♻️ Existing WhatsApp session detected. Restoring connection...');
     } else {
-      log('🆕 No authenticated session detected. Preparing first-time pairing...');
+      log('🆕 No authenticated session. Preparing pairing...');
     }
 
-    let phoneNumber = cleanPhoneNumber(settings.ownerNumber);
+    let phoneNumber = cleanPhoneNumber(phoneOverride || settings.ownerNumber);
     if (!registeredAtStartup && !phoneNumber) {
-      phoneNumber = cleanPhoneNumber(await question('Enter WhatsApp number (country code + number, digits only): '));
+      phoneNumber = cleanPhoneNumber(await question('Enter WhatsApp number (digits only): '));
     }
-    if (!registeredAtStartup && !phoneNumber) throw new Error('No WhatsApp number supplied. Set settings.ownerNumber first.');
+    if (!registeredAtStartup && !phoneNumber) throw new Error('No WhatsApp number supplied.');
     if (!registeredAtStartup) log(`📱 Pairing number: ${phoneNumber}`);
 
     const logger = pino({ level: process.env.BAILEYS_LOG_LEVEL || 'silent' });
@@ -165,11 +166,8 @@ async function start() {
       keepAliveIntervalMs: 15000,
       qrTimeout: 120000
     });
-    log('📡 Socket created. Waiting for WhatsApp handshake...');
+    log('📡 Socket created. Waiting for handshake...');
 
-    // Cache the exact message returned by Baileys immediately after sending.
-    // This is more reliable than waiting for messages.upsert, because a retry
-    // receipt can arrive before the normal upsert event reaches our handler.
     const originalSendMessage = sock.sendMessage.bind(sock);
     sock.sendMessage = async (...args) => {
       const sent = await originalSendMessage(...args);
@@ -180,8 +178,8 @@ async function start() {
     sock.ev.on('creds.update', async () => {
       try {
         await saveCreds();
-        if (!state.creds.registered) log('💾 Authentication state updated; waiting for device linking...');
-      } catch (e) { fail('Could not save authentication credentials.', e); }
+        if (!state.creds.registered) log('💾 Auth state updated; waiting for device link...');
+      } catch (e) { fail('Could not save credentials.', e); }
     });
 
     sock.ev.on('messages.upsert', async upsert => {
@@ -194,19 +192,20 @@ async function start() {
 
     sock.ev.on('contacts.upsert', contacts => {
       try { cacheContactNames(contacts); }
-      catch (e) { warn(`Could not cache contact names: ${e.message}`); }
+      catch (e) { warn(`Contact cache error: ${e.message}`); }
     });
     sock.ev.on('contacts.update', contacts => {
       try { cacheContactNames(contacts); }
-      catch (e) { warn(`Could not update contact names: ${e.message}`); }
+      catch (e) { warn(`Contact update error: ${e.message}`); }
     });
-
     sock.ev.on('status.update', async status => {
       try { await handleStatusEvent(sock, status); }
       catch (e) { fail('Status handler error.', e); }
     });
 
-    // ==================== FIXED PAIRING LOGIC (now uses Linux Chrome) ====================
+    // ═══════════════════════════════════════════
+    // CONNECTION UPDATE
+    // ═══════════════════════════════════════════
     let pairingRequested = false;
     let pairingInProgress = false;
     let opened = false;
@@ -215,83 +214,105 @@ async function start() {
       const { connection, lastDisconnect, qr } = update;
       const code = statusCodeOf(lastDisconnect?.error);
 
-      if (connection === 'connecting') log('🔄 WhatsApp state: CONNECTING');
+      if (connection === 'connecting') {
+        global.__waStatus = 'connecting';
+        log('🔄 WhatsApp state: CONNECTING');
+      }
 
-      // === Request one pairing code only. Keep the single clean display. ===
+      // ─── Pairing code ───────────────────────
       if (qr && !registeredAtStartup && !pairingRequested && !pairingInProgress) {
         pairingInProgress = true;
         try {
-          log('📲 Pairing interface ready. Waiting for full handshake...');
+          log('📲 Pairing interface ready...');
           await delay(1500);
-
           if (state.creds.registered || opened || stopping) return;
 
-          log('🔗 Requesting the single pairing code...');
+          log('🔗 Requesting pairing code...');
           const rawCode = await sock.requestPairingCode(phoneNumber);
           const formatted = formatPairingCode(rawCode);
           pairingRequested = true;
 
+          // Console
           log('');
           log('╔══════════════════════════════════════╗');
           log(`║       📱 PAIRING CODE: ${formatted}       ║`);
           log('╚══════════════════════════════════════╝');
           log('');
           log('📱 WhatsApp → Settings → Linked Devices → Link a Device');
-          log('🔗 Choose “Link with phone number instead”.');
+          log('🔗 Choose "Link with phone number instead".');
           log(`⌨️ Enter: ${formatted}`);
-          log('⏱️ Enter the code **once**. Do not request another code.');
-          log('⌛ Waiting for WhatsApp to approve the new linked device...');
+
+          // Telegram
+          tg.send(
+            `📱 *WhatsApp Pairing Code*\n\n` +
+            `\`${formatted}\`\n\n` +
+            `*Steps:*\n` +
+            `1️⃣ Open WhatsApp\n` +
+            `2️⃣ Settings → Linked Devices\n` +
+            `3️⃣ Link a Device\n` +
+            `4️⃣ Tap "Link with phone number instead"\n` +
+            `5️⃣ Enter the code above ⬆️\n\n` +
+            `_Enter the code only once._`
+          );
         } catch (e) {
           pairingRequested = false;
           const pairCode = statusCodeOf(e);
           fail(`Pairing-code request failed${pairCode ? ` (status ${pairCode})` : ''}.`, e);
+          tg.send(`❌ Pairing failed${pairCode ? ` (code ${pairCode})` : ''}.\nWait a bit before retrying.`);
           if ([400, 408, 428, 429, 515].includes(pairCode)) {
-            warn('WhatsApp/Baileys rejected the new-device handshake.');
-            warn('Do not spam pairing requests; wait before trying a fresh login.');
+            warn('WhatsApp rejected the handshake. Do not spam.');
           }
         } finally {
           pairingInProgress = false;
         }
       }
 
+      // ─── Open (connected) ───────────────────
       if (connection === 'open') {
         opened = true;
         pairingRequested = true;
+        global.__waStatus = 'connected';
+
         log('');
         log('╔══════════════════════════════════════════╗');
-        log(`║  ✅ ${settings.botName} CONNECTED SUCCESSFULLY  ║`);
+        log(`║  ✅ ${settings.botName} CONNECTED  ║`);
         log('╚══════════════════════════════════════════╝');
         log(`👤 Linked account: ${sock.user?.id || 'unknown'}`);
-        log('💾 Session credentials are active on disk.');
-        log('🤖 Bot handlers are running.');
+        log('💾 Session credentials active.');
+        log('🤖 Handlers running.');
+
+        tg.send(`✅ *ꜱᴀꜱᴜᴋᴇX Connected*\nLinked: \`${sock.user?.id || 'unknown'}\``);
 
         if (!ownerNotifiedThisRun) {
           const owner = getOwnerJid(sock);
           if (owner) {
             try {
               await sock.sendMessage(owner, {
-                text: `✅ *${settings.botName} Connected*\n\nYour WhatsApp is now connected with *Special Script Bot*. Try "*/menu*" to view full command list! Be anonymous, use your WhatsApp like a pro!\n\n> Created by *©Ahsan Habib Muaz*.\n\nhttps://tinyurl.com/SpecialScriptBot`
+                text: `✅ *${settings.botName} Connected*\n\nYour WhatsApp is now connected with *ꜱᴀꜱᴜᴋᴇX*. Send \`/menu\` to see all commands.\n\n> ᴘᴏᴡᴇʀᴇᴅ ʙʏ *ꜱᴀꜱᴜᴋᴇX*`
               });
               ownerNotifiedThisRun = true;
-              log(`📨 Connection confirmation sent to ${owner}.`);
-            } catch (e) { warn(`Connected, but confirmation message could not be sent: ${e.message}`); }
+              log(`📨 Confirmation sent to ${owner}.`);
+            } catch (e) { warn(`Confirmation send failed: ${e.message}`); }
           }
         } else {
-          log('🔄 Session re-established after a routine reconnect (notice already sent this run).');
+          log('🔄 Routine reconnect (notice already sent).');
         }
       }
 
+      // ─── Close (disconnected) ───────────────
       if (connection === 'close') {
-        const reason = lastDisconnect?.error?.message || 'unknown reason';
-        fail(`WhatsApp connection closed (${code || 'no status code'}): ${reason}`);
+        const reason = lastDisconnect?.error?.message || 'unknown';
+        global.__waStatus = `disconnected (${code || 'no code'})`;
+        fail(`WhatsApp closed (${code || 'no status'}): ${reason}`);
 
         if (!opened && !state.creds.registered) {
-          if (code === 428) warn('New-device handshake closed with 428 (Precondition Required).');
-          if (code === 515) warn('WhatsApp requested a restart during new-device pairing.');
-          if (code === 429) warn('WhatsApp rate-limited the pairing attempt.');
+          if (code === 428) warn('Handshake closed with 428 (Precondition Required).');
+          if (code === 515) warn('WhatsApp requested restart during pairing.');
+          if (code === 429) warn('Rate-limited by WhatsApp.');
         }
         if (code === DisconnectReason.loggedOut) {
-          warn('Session was logged out. Delete session/ only when intentionally starting fresh.');
+          warn('Session logged out. Delete session/ to start fresh.');
+          tg.send('⚠️ *WhatsApp Logged Out.*\nDelete `session/` folder and `/connect` again.');
           startInProgress = false;
           return;
         }
@@ -300,7 +321,7 @@ async function start() {
         let wait = 5000;
         if ([408, 428, 515].includes(code) && !state.creds.registered) wait = 30000;
         if (code === 429) wait = 120000;
-        log(`🔁 Reconnect scheduled in ${Math.round(wait / 1000)} seconds...`);
+        log(`🔁 Reconnect in ${Math.round(wait / 1000)}s...`);
         reconnectTimer = setTimeout(() => {
           reconnectTimer = null;
           startInProgress = false;
@@ -312,7 +333,7 @@ async function start() {
     fail('Fatal startup error.', err);
     if (!stopping) {
       startInProgress = false;
-      log('🔁 Retrying startup in 10 seconds...');
+      log('🔁 Retry startup in 10s...');
       setTimeout(() => start().catch(e => fail('Restart failed.', e)), 10000);
     }
     return;
@@ -320,10 +341,14 @@ async function start() {
   startInProgress = false;
 }
 
+// ═══════════════════════════════════════════════
+// SHUTDOWN
+// ═══════════════════════════════════════════════
 function shutdown(signal) {
   if (stopping) return;
   stopping = true;
-  log(`🛑 ${signal} received. Shutting down cleanly...`);
+  log(`🛑 ${signal} received. Shutting down...`);
+  tg.send(`🛑 Bot shutting down (${signal}).`);
   if (reconnectTimer) clearTimeout(reconnectTimer);
   if (rl) rl.close();
   process.exit(0);
@@ -332,4 +357,17 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('uncaughtException', e => fail('Uncaught exception.', e));
 process.on('unhandledRejection', e => fail('Unhandled promise rejection.', e));
+
+// ═══════════════════════════════════════════════
+// BOOT — Telegram bridge first, then WhatsApp
+// ═══════════════════════════════════════════════
+log('🚀 Booting ꜱᴀꜱᴜᴋᴇX system...');
+
+tg.init(async (number) => {
+  log(`📲 Telegram /connect received for +${number}`);
+  startInProgress = false;
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  await start(number);
+});
+
 start().catch(e => fail('Fatal startup error.', e));

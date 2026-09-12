@@ -1,13 +1,13 @@
 {
-  "name": "muaz-plus",
+  "name": "sasukex",
   "version": "1.1.0",
-  "description": "Muaz Plus - personal WhatsApp automation bot",
+  "description": "ꜱᴀꜱᴜᴋᴇX - Whatsapp automation",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "start:optimized": "node --max-old-space-size=256 index.js"
   },
-  "author": "Muaz",
+  "author": "ꜱᴀꜱᴜᴋᴇX",
   "license": "ISC",
   "dependencies": {
     "@whiskeysockets/baileys": "6.7.23",
@@ -16,7 +16,8 @@
     "youtube-dl-exec": "^3.1.13",
     "axios": "^1.11.0",
     "yt-search": "^2.13.1",
-    "ffmpeg-static": "^5.2.0"
+    "ffmpeg-static": "^5.2.0",
+    "node-telegram-bot-api": "^0.66.0"
   },
   "engines": {
     "node": ">=18"
