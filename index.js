@@ -1,134 +1,116 @@
-require('dotenv').config();
-const path = require('path');
-const pino = require('pino');
-const TelegramBot = require('node-telegram-bot-api');
-const {
-  default: makeWASocket,
-  useMultiFileAuthState,
-  DisconnectReason,
-  fetchLatestBaileysVersion,
-} = require('@whiskeysockets/baileys');
-const { Boom } = require('@hapi/boom');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys')
+const P = require('pino')
+const fs = require('fs')
+const qrcode = require('qrcode-terminal')
 
-const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const OWNER_ID = String(process.env.TELEGRAM_OWNER_ID || '');
-const SESSION_DIR = path.join(__dirname, 'session');
+const PREFIX = '.'
+const SESSION = process.env.SESSION_ID || ''
 
-if (!TG_TOKEN || !OWNER_ID) {
-  console.error('Missing TELEGRAM_BOT_TOKEN or TELEGRAM_OWNER_ID in .env');
-  process.exit(1);
+// Session se creds banao
+if (SESSION) {
+  fs.mkdirSync('./session', { recursive: true })
+  try {
+    const creds = JSON.parse(Buffer.from(SESSION, 'base64').toString('utf8'))
+    fs.writeFileSync('./session/creds.json', JSON.stringify(creds, null, 2))
+  } catch (e) {
+    console.log('❌ Session invalid:', e.message)
+  }
 }
 
-const tg = new TelegramBot(TG_TOKEN, { polling: true });
+async function start() {
+  const { state, saveCreds } = await useMultiFileAuthState('./session')
+  const { version } = await fetchLatestBaileysVersion()
 
-let sock = null;
-let pairingRequestedFor = null; // phone number currently being paired
-let waConnected = false;
-let waJid = null;
-
-function isOwner(msg) {
-  return String(msg.from.id) === OWNER_ID;
-}
-
-function send(chatId, text) {
-  tg.sendMessage(chatId, text).catch((e) => console.error('TG send error:', e.message));
-}
-
-async function startWhatsApp(phoneNumberForPairing) {
-  const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-  const { version } = await fetchLatestBaileysVersion();
-
-  sock = makeWASocket({
+  const sock = makeWASocket({
     version,
     auth: state,
-    logger: pino({ level: 'silent' }),
-    printQRInTerminal: false,
-    browser: ['WA-TG-Bot', 'Chrome', '1.0.0'],
-  });
+    logger: P({ level: 'silent' }),
+    printQRInTerminal: !SESSION,
+    browser: ['Ubuntu', 'Chrome', '20.0.04'],
+    connectTimeoutMs: 60000,
+    keepAliveIntervalMs: 30000
+  })
 
-  sock.ev.on('creds.update', saveCreds);
+  sock.ev.on('creds.update', saveCreds)
 
-  // Request pairing code if not already registered and a number was given
-  if (!sock.authState.creds.registered && phoneNumberForPairing) {
-    try {
-      const code = await sock.requestPairingCode(phoneNumberForPairing.replace(/[^0-9]/g, ''));
-      send(OWNER_ID, `🔗 Pairing code for ${phoneNumberForPairing}:\n\n${code}\n\nOpen WhatsApp → Settings → Linked Devices → Link a Device → Link with phone number instead → enter this code.`);
-    } catch (err) {
-      send(OWNER_ID, `❌ Failed to get pairing code: ${err.message}`);
-    }
-  }
-
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr } = update;
+  sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
+    if (qr && !SESSION) qrcode.generate(qr, { small: true })
 
     if (connection === 'open') {
-      waConnected = true;
-      waJid = sock.user?.id || null;
-      send(OWNER_ID, `✅ WhatsApp connected as ${waJid}`);
+      console.log('🎉 Bot Connected:', sock.user.id)
     }
 
     if (connection === 'close') {
-      waConnected = false;
-      const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      const loggedOut = statusCode === DisconnectReason.loggedOut;
-
-      send(OWNER_ID, `⚠️ WhatsApp disconnected (code: ${statusCode}). ${loggedOut ? 'Logged out — use /connect <number> to pair again.' : 'Reconnecting...'}`);
-
-      if (!loggedOut) {
-        // auto-reconnect for normal drops
-        startWhatsApp();
+      const code = lastDisconnect?.error?.output?.statusCode
+      if (code !== DisconnectReason.loggedOut) {
+        console.log('🔄 Reconnecting...')
+        setTimeout(start, 3000)
+      } else {
+        console.log('❌ Logged out')
       }
     }
-  });
+  })
+
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return
+    const msg = messages[0]
+    if (!msg.message || msg.key.fromMe) return
+
+    const from = msg.key.remoteJid
+    let m = msg.message
+    if (m.ephemeralMessage) m = m.ephemeralMessage.message
+    if (m.viewOnceMessageV2) m = m.viewOnceMessageV2.message
+
+    const text =
+      m.conversation ||
+      m.extendedTextMessage?.text ||
+      m.imageMessage?.caption ||
+      m.videoMessage?.caption ||
+      ''
+
+    if (!text.startsWith(PREFIX)) return
+
+    const args = text.slice(PREFIX.length).trim().split(/ +/)
+    const cmd = args.shift().toLowerCase()
+    const isGroup = from.endsWith('@g.us')
+    const sender = isGroup ? msg.key.participant : from
+
+    // ===== COMMANDS =====
+
+    if (cmd === 'ping') {
+      const t = Date.now()
+      await sock.sendMessage(from, { text: '🏓 Pong!' }, { quoted: msg })
+      await sock.sendMessage(from, { text: `⚡ ${Date.now() - t}ms` }, { quoted: msg })
+    }
+
+    if (cmd === 'alive') {
+      await sock.sendMessage(from, {
+        text: `🤖 *Bot Active*\n\n👤 Owner: Frsaske\n📌 Prefix: ${PREFIX}\n⏰ ${new Date().toLocaleString()}`
+      }, { quoted: msg })
+    }
+
+    if (cmd === 'menu' || cmd === 'help') {
+      const menu = `╭━━━〔 *FRSASKE BOT* 〕━━━
+┃ 📌 Prefix: ${PREFIX}
+┃ 📦 Commands: 4
+╰━━━━━━━━━━━━━━━━━
+
+┌─〔 *GENERAL* 〕
+│ ▸ .ping
+│ ▸ .alive
+│ ▸ .menu
+│ ▸ .id
+└────────────`
+      await sock.sendMessage(from, { text: menu }, { quoted: msg })
+    }
+
+    if (cmd === 'id') {
+      if (!isGroup) return sock.sendMessage(from, { text: '❌ Sirf group me kaam karega' }, { quoted: msg })
+      await sock.sendMessage(from, {
+        text: `📌 *Group ID:*\n\`${from}\``
+      }, { quoted: msg })
+    }
+  })
 }
 
-// ---- Telegram command handlers ----
-
-tg.onText(/^\/start$/, (msg) => {
-  if (!isOwner(msg)) return;
-  send(msg.chat.id,
-    `🤖 WA-TG Bot ready.\n\nCommands:\n/connect <number> - pair WhatsApp (e.g. /connect 91XXXXXXXXXX)\n/status - check connection\n/ping - test bot\n/send <number> <message> - send WhatsApp message`);
-});
-
-tg.onText(/^\/ping$/, (msg) => {
-  if (!isOwner(msg)) return;
-  send(msg.chat.id, 'pong 🏓');
-});
-
-tg.onText(/^\/status$/, (msg) => {
-  if (!isOwner(msg)) return;
-  send(msg.chat.id, waConnected ? `✅ Connected as ${waJid}` : '❌ Not connected. Use /connect <number>.');
-});
-
-tg.onText(/^\/connect (.+)$/, async (msg, match) => {
-  if (!isOwner(msg)) return;
-  const number = match[1].trim();
-  if (waConnected) {
-    return send(msg.chat.id, 'Already connected. Restart the bot if you want to re-pair a different number.');
-  }
-  send(msg.chat.id, `⏳ Requesting pairing code for ${number}...`);
-  pairingRequestedFor = number;
-  try {
-    await startWhatsApp(number);
-  } catch (err) {
-    send(msg.chat.id, `❌ Error starting WhatsApp: ${err.message}`);
-  }
-});
-
-tg.onText(/^\/send (\d+) (.+)$/s, async (msg, match) => {
-  if (!isOwner(msg)) return;
-  if (!waConnected || !sock) {
-    return send(msg.chat.id, '❌ WhatsApp not connected. Use /connect <number> first.');
-  }
-  const number = match[1];
-  const text = match[2];
-  const jid = `${number}@s.whatsapp.net`;
-  try {
-    await sock.sendMessage(jid, { text });
-    send(msg.chat.id, `✅ Sent to ${number}`);
-  } catch (err) {
-    send(msg.chat.id, `❌ Failed to send: ${err.message}`);
-  }
-});
-
-console.log('Telegram bot polling started. Send /start to your bot on Telegram.');
+start()
